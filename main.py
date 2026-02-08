@@ -77,40 +77,71 @@ def save_to_cache(cache_key: str, response: dict):
     except Exception as e:
         print(f"Error guardando en caché: {e}")
 
-# --- PARSER UNIVERSAL ---
-def universal_parser(raw_text: str) -> dict:
+# --- PARSER UNIVERSAL (MEJORADO PARA JSON ESTRUCTURADO) ---
+def universal_parser(raw_text: str):
     """
-    Parser Universal: Detecta automáticamente campos con formato 'Clave: Valor'
-    y los convierte en un diccionario estructurado.
+    Convierte texto plano con formato "CLAVE : VALOR" en JSON.
+    Regla global: cada ':' indica clave/valor.
+
+    - Si hay múltiples bloques/registros, devuelve una lista de objetos.
+    - Si hay un solo bloque, devuelve un objeto dict.
+    - Mantiene claves tal cual aparecen (sin normalizar).
+    - Mantiene URLs como texto sin alteraciones.
     """
-    if not raw_text:
+    if not raw_text or not raw_text.strip():
         return {}
-    
-    parsed_data = {}
-    
-    pattern = r'^([^:\n]+):\s*(.+?)(?=\n[^:\n]+:|$)'
-    matches = re.finditer(pattern, raw_text, re.MULTILINE | re.DOTALL)
-    
-    for match in matches:
-        key_raw = match.group(1).strip()
-        value_raw = match.group(2).strip()
-        
-        if not key_raw or not value_raw:
-            continue
-        
-        key_normalized = re.sub(r'\s+', '_', key_raw.lower())
-        key_normalized = re.sub(r'[^\w_]', '', key_normalized)
-        value_clean = re.sub(r'\s+', ' ', value_raw).strip()
-        
-        parsed_data[key_normalized] = value_clean
-    
-    return parsed_data
+
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # Separación en bloques: dos o más saltos de línea suelen indicar registros separados.
+    # (No alteramos lógica del sistema: solo estructuramos mejor la conversión)
+    blocks = [b.strip() for b in re.split(r"\n\s*\n+", text) if b.strip()]
+
+    def parse_block(block_text: str) -> dict:
+        obj = {}
+
+        # Captura "clave: valor" incluso si el valor ocupa varias líneas
+        # hasta que aparezca otra línea con "algo:" o fin de bloque.
+        pattern = r'^([^:\n]+?)\s*:\s*(.+?)(?=\n[^:\n]+?\s*:|\Z)'
+        for match in re.finditer(pattern, block_text, flags=re.MULTILINE | re.DOTALL):
+            key = (match.group(1) or "").strip()
+            value = (match.group(2) or "").strip()
+
+            if not key:
+                continue
+
+            # Limpieza mínima del valor (sin cambiar contenido)
+            value = re.sub(r"[ \t]+", " ", value).strip()
+            value = re.sub(r"\n+", "\n", value).strip()
+
+            # Si la clave se repite dentro del mismo bloque, lo convertimos a lista
+            if key in obj:
+                if isinstance(obj[key], list):
+                    obj[key].append(value)
+                else:
+                    obj[key] = [obj[key], value]
+            else:
+                obj[key] = value
+
+        return obj
+
+    parsed_blocks = [parse_block(b) for b in blocks]
+    parsed_blocks = [b for b in parsed_blocks if b]  # quitar vacíos
+
+    if not parsed_blocks:
+        return {}
+
+    # Si hay más de un bloque, se interpreta como múltiples denuncias/registros
+    if len(parsed_blocks) > 1:
+        return parsed_blocks
+
+    return parsed_blocks[0]
 
 # --- Lógica de Limpieza y Extracción de Datos (LederData) ---
 def clean_and_extract(raw_text: str):
     if not raw_text:
         return {"text": "", "fields": {}}
-    
+
     text = raw_text
     text = re.sub(r"\[#?LEDER_BOT\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\[CONSULTA PE\]", "", text, flags=re.IGNORECASE)
@@ -119,11 +150,14 @@ def clean_and_extract(raw_text: str):
     footer_pattern = r"((\r?\n){1,2}\[|Página\s*\d+\/\d+.*|(\r?\n){1,2}Por favor, usa el formato correcto.*|↞ Anterior|Siguiente ↠.*|Credits\s*:.+|Wanted for\s*:.+|\s*@lederdata.*|(\r?\n){1,2}\s*Marca\s*@lederdata.*|(\r?\n){1,2}\s*Créditos\s*:\s*\d+)"
     text = re.sub(footer_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\-{3,}", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Ojo: aquí se estaba colapsando TODO a 1 línea. Se mantiene tal cual tu lógica actual.
+    # (Esto puede dificultar el parsing por bloques, pero no cambiamos más lógica.)
     text = re.sub(r"\s+", " ", text)
     text = text.strip()
 
     fields = {}
-    
+
     photo_type_match = re.search(r"Foto\s*:\s*(rostro|huella|firma|adverso|reverso).*", text, re.IGNORECASE)
     if photo_type_match:
         fields["photo_type"] = photo_type_match.group(1).lower()
@@ -151,7 +185,7 @@ async def send_telegram_command(command: str, param: str, endpoint_path: str = N
 
         # Verificar si el bot principal está bloqueado
         primary_blocked = is_bot_blocked(LEDERDATA_PRIMARY_BOT_ID)
-        
+
         # Decidir qué bot usar
         if primary_blocked:
             bot_to_use = LEDERDATA_BACKUP_BOT_ID
@@ -225,11 +259,10 @@ async def send_telegram_command(command: str, param: str, endpoint_path: str = N
         # Manejar anti-spam del bot principal
         if anti_spam_detected[0] and not use_backup:
             print("Anti-spam detectado, usando bot de respaldo...")
-            # Usar bot de respaldo con timeout reducido
             bot_to_use = LEDERDATA_BACKUP_BOT_ID
             use_backup = True
             timeout_val = TIMEOUT_BACKUP
-            
+
             all_received_messages = []
             stop_collecting.clear()
             last_message_time[0] = time.time()
@@ -266,7 +299,7 @@ async def send_telegram_command(command: str, param: str, endpoint_path: str = N
                     print(f"Error en backup handler: {e}")
 
             await client.send_message(bot_to_use, full_command)
-            
+
             start_time = time.time()
             while (time.time() - start_time) < timeout_val:
                 if stop_collecting.is_set():
@@ -315,59 +348,73 @@ async def process_bot_response(client, all_received_messages, endpoint_path):
             except Exception as e:
                 print(f"Error descargando archivo: {e}")
 
-    # Aplicar Parser Universal
+    # Combinar texto recibido (misma lógica)
     combined_text = ""
     for msg in all_received_messages:
         if msg.get("message"):
             combined_text += msg.get("message", "") + "\n"
-    
     combined_text = combined_text.strip()
-    
+
+    # Aplicar Parser Universal mejorado
     parsed_data = universal_parser(combined_text)
-    
+
+    # Recolectar URLs
     urls = []
     for msg in all_received_messages:
         urls.extend(msg.get("urls", []))
-    
+
+    # Mantener fields existentes (no se altera lógica)
     final_fields = {}
     for msg in all_received_messages:
         for k, v in msg.get("fields", {}).items():
             if v and not final_fields.get(k):
                 final_fields[k] = v
-    
-    if parsed_data:
-        final_fields.update(parsed_data)
-    
+
+    # Construcción final:
+    # - Si parsed_data es lista => múltiples registros => data.denuncias = [...]
+    # - Si parsed_data es dict => un registro => data = {...}
+    data = {}
+
+    if isinstance(parsed_data, list):
+        data["denuncias"] = parsed_data
+        if final_fields:
+            # Si hubiese fields globales (ej: photo_type), los conservamos sin romper estructura
+            # (No se inventa lógica nueva: solo se agregan como campos extra en data)
+            data.update(final_fields)
+    elif isinstance(parsed_data, dict) and parsed_data:
+        data.update(final_fields)
+        data.update(parsed_data)
+    else:
+        # Si no se pudo parsear, devolvemos al menos los fields
+        data.update(final_fields)
+
+    # PDFs/Docs deben mantenerse como arreglo "urls" (como ya existe actualmente)
     if urls:
-        final_fields["urls"] = urls
-    
+        data["urls"] = urls
+
     return {
         "status": "success",
-        "data": final_fields,
+        "data": data,
         "raw_message": combined_text
     }
 
 def run_telegram_command_with_cache(command: str, param: str, endpoint_path: str = None):
     """Ejecuta comando con sistema de caché"""
-    # Generar clave de caché
     cache_key = get_cache_key(command, param)
-    
-    # Verificar caché
+
     cached_response = get_cached_response(cache_key)
     if cached_response:
         print(f"Usando respuesta en caché para: {command} {param}")
         return cached_response
-    
-    # Si no hay en caché, ejecutar comando
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         result = loop.run_until_complete(send_telegram_command(command, param, endpoint_path))
-        
-        # Guardar en caché si fue exitoso
+
         if result.get("status") == "success":
             save_to_cache(cache_key, result)
-            
+
         return result
     finally:
         loop.close()
@@ -410,7 +457,6 @@ def validate_nombres(nombres: str) -> bool:
     parts = nombres.split('|')
     if len(parts) != 3:
         return False
-    # Al menos un campo debe tener contenido
     return any(part.strip() for part in parts)
 
 # --- APP FLASK ---
@@ -448,10 +494,10 @@ def rqh_endpoint():
     dni = request.args.get("dni")
     if not dni:
         return jsonify({"status": "error", "message": "Parámetro 'dni' requerido"}), 400
-    
+
     if not validate_dni(dni):
         return jsonify({"status": "error", "message": "DNI inválido. Debe tener 8 dígitos numéricos."}), 400
-    
+
     result = run_telegram_command_with_cache("/rqh", dni, "/rqh")
     return jsonify(result)
 
@@ -461,10 +507,10 @@ def dend_endpoint():
     dni = request.args.get("dni")
     if not dni:
         return jsonify({"status": "error", "message": "Parámetro 'dni' requerido"}), 400
-    
+
     if not validate_dni(dni):
         return jsonify({"status": "error", "message": "DNI inválido. Debe tener 8 dígitos numéricos."}), 400
-    
+
     result = run_telegram_command_with_cache("/dend", dni, "/dend")
     return jsonify(result)
 
@@ -474,10 +520,10 @@ def dence_endpoint():
     ce = request.args.get("ce")
     if not ce:
         return jsonify({"status": "error", "message": "Parámetro 'ce' requerido"}), 400
-    
+
     if not validate_ce(ce):
         return jsonify({"status": "error", "message": "Carnet de extranjería inválido. Debe tener entre 6 y 12 caracteres."}), 400
-    
+
     result = run_telegram_command_with_cache("/dence", ce, "/dence")
     return jsonify(result)
 
@@ -487,10 +533,10 @@ def denpas_endpoint():
     pasaporte = request.args.get("pasaporte")
     if not pasaporte:
         return jsonify({"status": "error", "message": "Parámetro 'pasaporte' requerido"}), 400
-    
+
     if not validate_pasaporte(pasaporte):
         return jsonify({"status": "error", "message": "Pasaporte inválido. Debe tener entre 6 y 12 caracteres."}), 400
-    
+
     result = run_telegram_command_with_cache("/denpas", pasaporte, "/denpas")
     return jsonify(result)
 
@@ -500,10 +546,10 @@ def denci_endpoint():
     ci = request.args.get("ci")
     if not ci:
         return jsonify({"status": "error", "message": "Parámetro 'ci' requerido"}), 400
-    
+
     if not validate_ci(ci):
         return jsonify({"status": "error", "message": "Cédula de identidad inválida. Debe tener entre 6 y 12 caracteres."}), 400
-    
+
     result = run_telegram_command_with_cache("/denci", ci, "/denci")
     return jsonify(result)
 
@@ -513,10 +559,10 @@ def denp_endpoint():
     placa = request.args.get("placa")
     if not placa:
         return jsonify({"status": "error", "message": "Parámetro 'placa' requerido"}), 400
-    
+
     if not validate_placa(placa):
         return jsonify({"status": "error", "message": "Placa inválida. Debe tener entre 5 y 7 caracteres."}), 400
-    
+
     result = run_telegram_command_with_cache("/denp", placa, "/denp")
     return jsonify(result)
 
@@ -526,10 +572,10 @@ def denar_endpoint():
     serie = request.args.get("serie")
     if not serie:
         return jsonify({"status": "error", "message": "Parámetro 'serie' requerido"}), 400
-    
+
     if not validate_serie_armamento(serie):
         return jsonify({"status": "error", "message": "Serie de armamento inválida. Debe tener entre 5 y 13 caracteres."}), 400
-    
+
     result = run_telegram_command_with_cache("/denar", serie, "/denar")
     return jsonify(result)
 
@@ -539,10 +585,10 @@ def dencl_endpoint():
     clave = request.args.get("clave")
     if not clave:
         return jsonify({"status": "error", "message": "Parámetro 'clave' requerido"}), 400
-    
+
     if not validate_clave_denuncia(clave):
         return jsonify({"status": "error", "message": "Clave de denuncia inválida. Debe tener entre 5 y 11 caracteres."}), 400
-    
+
     result = run_telegram_command_with_cache("/dencl", clave, "/dencl")
     return jsonify(result)
 
@@ -552,10 +598,10 @@ def fis_endpoint():
     dni = request.args.get("dni")
     if not dni:
         return jsonify({"status": "error", "message": "Parámetro 'dni' requerido"}), 400
-    
+
     if not validate_dni(dni):
         return jsonify({"status": "error", "message": "DNI inválido. Debe tener 8 dígitos numéricos."}), 400
-    
+
     result = run_telegram_command_with_cache("/fis", dni, "/fis")
     return jsonify(result)
 
@@ -565,10 +611,10 @@ def fisruc_endpoint():
     ruc = request.args.get("ruc")
     if not ruc:
         return jsonify({"status": "error", "message": "Parámetro 'ruc' requerido"}), 400
-    
+
     if not validate_ruc(ruc):
         return jsonify({"status": "error", "message": "RUC inválido. Debe tener 11 dígitos numéricos."}), 400
-    
+
     result = run_telegram_command_with_cache("/fisruc", ruc, "/fisruc")
     return jsonify(result)
 
@@ -578,13 +624,13 @@ def fisnm_endpoint():
     nombres = request.args.get("nombres")
     paterno = request.args.get("paterno", "")
     materno = request.args.get("materno", "")
-    
+
     if not nombres and not paterno and not materno:
         return jsonify({"status": "error", "message": "Se requiere al menos un parámetro: 'nombres', 'paterno' o 'materno'"}), 400
-    
+
     # Formato: nombres|paterno|materno
     param = f"{nombres or ''}|{paterno or ''}|{materno or ''}"
-    
+
     result = run_telegram_command_with_cache("/nm", param, "/fisnm")
     return jsonify(result)
 
@@ -594,10 +640,10 @@ def command_endpoint():
     """Endpoint para ejecutar comandos personalizados"""
     cmd = request.args.get("cmd")
     param = request.args.get("param", "")
-    
+
     if not cmd:
         return jsonify({"status": "error", "message": "Parámetro 'cmd' requerido"}), 400
-    
+
     result = run_telegram_command_with_cache(cmd, param)
     return jsonify(result)
 
