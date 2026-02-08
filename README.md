@@ -1,1 +1,0 @@
-# Denuncias_vankend.tlgm
